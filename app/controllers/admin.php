@@ -34,8 +34,8 @@ function admin_login_submit()
     $to = isset($_SESSION['admin_after_login']) ? $_SESSION['admin_after_login'] : null;
     unset($_SESSION['admin_after_login']);
     if ($a['role'] === 'checkin') redirect('/admin/checkin');
-    if ($to && strpos($to, '/') === 0) {
-        header('Location: ' . $to);
+    if ($to) {
+        header('Location: ' . safe_local_path($to));
         exit;
     }
     redirect('/admin');
@@ -466,8 +466,7 @@ function admin_issue_submit()
     }
     $user = db_row('SELECT * FROM users WHERE mobile = ?', [$mobile]);
     if (!$user) {
-        $uid = db_insert('users', ['mobile' => $mobile, 'first_name' => input('first_name') ?: null, 'last_name' => input('last_name') ?: null, 'company' => input('company') ?: null, 'created_at' => now()]);
-        $user = db_row('SELECT * FROM users WHERE id = ?', [$uid]);
+        $user = user_find_or_create($mobile, ['first_name' => input('first_name') ?: null, 'last_name' => input('last_name') ?: null, 'company' => input('company') ?: null]);
     } elseif (!$user['first_name'] && input('first_name') !== '') {
         db_update('users', ['first_name' => input('first_name'), 'last_name' => input('last_name') ?: null, 'company' => input('company') ?: $user['company']], 'id = ?', [(int)$user['id']]);
     }
@@ -619,8 +618,10 @@ function settings_fields()
             'about_text' => ['متن معرفی رویداد', 'textarea'],
             'audience_text' => ['مخاطبان رویداد', 'textarea'],
         ],
-        'فروش' => [
+        'فروش و ترافیک کمپین' => [
             'hold_minutes' => ['مدت نگهداری صندلی پیش از پرداخت (دقیقه)', 'number'],
+            'otp_ip_limit' => ['سقف درخواست کد ورود از یک IP در ساعت (کاربران اپراتورهای موبایل IP مشترک دارند؛ در کمپین ۵۰۰ تا ۱۰۰۰)', 'number'],
+            'ip_header' => ['سایت پشت CDN است؟ (برای تشخیص IP واقعی کاربر)', 'select', ['' => 'خیر – اتصال مستقیم', 'HTTP_AR_REAL_IP' => 'ابر آروان (ArvanCloud)', 'HTTP_CF_CONNECTING_IP' => 'Cloudflare', 'HTTP_X_FORWARDED_FOR' => 'سایر (X-Forwarded-For)']],
         ],
         'درگاه پرداخت' => [
             'gateway' => ['درگاه فعال', 'select', ['fake' => 'آزمایشی (بدون پرداخت واقعی)', 'zarinpal' => 'زرین‌پال', 'zibal' => 'زیبال']],

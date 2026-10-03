@@ -42,10 +42,13 @@ function booking_create(array $user, array $session, array $seatIds, array $opts
         $result = db_tx(function () use ($user, $sid, $seatIds, $n, $seats, $subtotal, $t, $until, $manual, $opts) {
         if (!$manual) {
             // One pending order per user per session: release the previous one.
-            $prev = db_col('SELECT id FROM orders WHERE user_id = ? AND session_id = ? AND status = ? FOR UPDATE', [(int)$user['id'], $sid, 'pending']);
+            // Plain read (no FOR UPDATE on the secondary index: its gap locks would
+            // serialise / deadlock unrelated buyers). Row updates below lock by primary key.
+            $prev = db_col('SELECT id FROM orders WHERE user_id = ? AND session_id = ? AND status = ?', [(int)$user['id'], $sid, 'pending']);
             if ($prev) {
+                $prev = array_map('intval', $prev);
+                db_exec('UPDATE orders SET status = ? WHERE id IN (' . db_in(count($prev)) . ') AND status = ?', array_merge(['cancelled'], $prev, ['pending']));
                 db_exec('UPDATE session_seats SET status = 0, order_id = NULL, hold_until = NULL WHERE session_id = ? AND status = 1 AND order_id IN (' . db_in(count($prev)) . ')', array_merge([$sid], $prev));
-                db_exec('UPDATE orders SET status = ? WHERE id IN (' . db_in(count($prev)) . ')', array_merge(['cancelled'], $prev));
             }
         }
         $orderId = db_insert('orders', [
@@ -112,7 +115,7 @@ function booking_reclaim(array $order, $extraSeconds)
     if (!$n) return false;
     $t = time();
     $until = max($t + $extraSeconds, (int)$order['hold_until']);
-    return db_tx(function () use ($sid, $ids, $n, $order, $t, $until) {
+    $ok = db_tx(function () use ($sid, $ids, $n, $order, $t, $until) {
         $claimed = db_exec(
             'UPDATE session_seats SET status = 1, order_id = ?, hold_until = ? WHERE session_id = ? AND seat_id IN (' . db_in($n) . ')
              AND (status = 0 OR (status = 1 AND (order_id = ? OR hold_until < ?)))',
@@ -128,6 +131,8 @@ function booking_reclaim(array $order, $extraSeconds)
         db_exec('UPDATE orders SET hold_until = ? WHERE id = ?', [$until, (int)$order['id']]);
         return true;
     });
+    session_status_invalidate($sid);
+    return $ok;
 }
 
 /**
@@ -136,14 +141,53 @@ function booking_reclaim(array $order, $extraSeconds)
  */
 function booking_finalize($orderId, array $payment)
 {
-    $done = db_tx(function () use ($orderId, $payment) {
+    try {
+        $done = booking_finalize_tx($orderId, $payment);
+    } catch (RuntimeException $e) {
+        if ($e->getMessage() !== 'SEAT_CONFLICT') throw $e;
+        // Paid, but a seat was taken in between (should not happen thanks to reclaim()).
+        // Keep the money trail and flag it for a manual refund / reseat by the admin.
+        db_update('orders', [
+            'status' => 'failed', 'ref_id' => isset($payment['ref_id']) ? $payment['ref_id'] : null,
+            'card_pan' => isset($payment['card']) ? $payment['card'] : null,
+            'note' => 'PAID BUT SEAT CONFLICT - refund or reseat manually',
+        ], 'id = ? AND status <> ?', [(int)$orderId, 'paid']);
+        log_error('SEAT_CONFLICT on paid order ' . $orderId);
+        return false;
+    }
+    if ($done === true) {
+        $o = db_row('SELECT session_id FROM orders WHERE id = ?', [(int)$orderId]);
+        session_status_invalidate($o['session_id']);
+        if (empty($payment['silent'])) {
+            defer(function () use ($orderId) {
+                booking_send_sms($orderId);
+            });
+        }
+    }
+    return (bool)$done;
+}
+
+function booking_finalize_tx($orderId, array $payment)
+{
+    return db_tx(function () use ($orderId, $payment) {
         $o = db_row('SELECT * FROM orders WHERE id = ? FOR UPDATE', [(int)$orderId]);
         if (!$o) return false;
         if ($o['status'] === 'paid') return 'already';
         $sid = (int)$o['session_id'];
         $items = db_all('SELECT seat_id FROM order_items WHERE order_id = ?', [(int)$o['id']]);
         $ids = array_map('intval', array_column($items, 'seat_id'));
-        db_exec('UPDATE session_seats SET status = 2, order_id = ?, hold_until = NULL WHERE session_id = ? AND seat_id IN (' . db_in(count($ids)) . ')', array_merge([(int)$o['id'], $sid], $ids));
+        $n = count($ids);
+        // Sell only seats that are held by this order (or free). Never overwrite a seat
+        // sold to / blocked for someone else, even if this payment was already settled.
+        $sold = db_exec(
+            'UPDATE session_seats SET status = 2, order_id = ?, hold_until = NULL WHERE session_id = ? AND seat_id IN (' . db_in($n) . ')
+             AND (status = 0 OR (status = 1 AND order_id = ?))',
+            array_merge([(int)$o['id'], $sid], $ids, [(int)$o['id']])
+        );
+        if ($sold !== $n) {
+            $mine = (int)db_val('SELECT COUNT(*) FROM session_seats WHERE session_id = ? AND order_id = ? AND status = 2', [$sid, (int)$o['id']]);
+            if ($mine !== $n) throw new RuntimeException('SEAT_CONFLICT');
+        }
         db_update('orders', [
             'status' => 'paid',
             'paid_at' => now(),
@@ -168,16 +212,6 @@ function booking_finalize($orderId, array $payment)
         }
         return true;
     });
-    if ($done === true) {
-        $o = db_row('SELECT session_id FROM orders WHERE id = ?', [(int)$orderId]);
-        session_status_invalidate($o['session_id']);
-        if (empty($payment['silent'])) {
-            defer(function () use ($orderId) {
-                booking_send_sms($orderId);
-            });
-        }
-    }
-    return (bool)$done;
 }
 
 function booking_send_sms($orderId)
@@ -190,6 +224,7 @@ function booking_send_sms($orderId)
     $parts = [];
     foreach ($tickets as $t) $parts[] = 'ر' . $t['row_no'] . ' ص' . $t['seat_no'];
     $link = count($tickets) === 1 ? abs_url('/t/' . ticket_token($tickets[0]['code'])) : abs_url('/order/' . $o['id']);
+    db_close();
     return sms_send_ticket($o['mobile'], [
         'name' => trim($o['first_name'] . ' ' . $o['last_name']) ?: 'کاربر',
         'session' => $o['title'],

@@ -17,6 +17,7 @@ function current_user()
 
 function require_user()
 {
+    start_session();
     $u = current_user();
     if (!$u) {
         $_SESSION['after_login'] = isset($_SERVER['REQUEST_URI']) ? $_SERVER['REQUEST_URI'] : url('/');
@@ -28,6 +29,24 @@ function require_user()
         redirect('/profile');
     }
     return $u;
+}
+
+/** Race-safe: two parallel sign-ins with the same new number must not fail. */
+function user_find_or_create($mobile, array $extra = [])
+{
+    $user = db_row('SELECT * FROM users WHERE mobile = ?', [$mobile]);
+    if ($user) return $user;
+    $cols = array_merge(['mobile' => $mobile, 'created_at' => now()], $extra);
+    db_exec('INSERT IGNORE INTO users (' . implode(',', array_keys($cols)) . ') VALUES (' . db_in(count($cols)) . ')', array_values($cols));
+    return db_row('SELECT * FROM users WHERE mobile = ?', [$mobile]);
+}
+
+/** Only same-site paths ("/x"), never "//host" or "/\\host" (open redirect). */
+function safe_local_path($p)
+{
+    $p = (string)$p;
+    if ($p === '' || $p[0] !== '/' || (isset($p[1]) && ($p[1] === '/' || $p[1] === '\\'))) return url('/');
+    return $p;
 }
 
 function login_user($userId)
@@ -60,7 +79,8 @@ function otp_send($mobile)
         return [true, 'کد قبلاً ارسال شده است.', $cool - ($t - (int)$row['sent_at'])];
     }
     if (!rate_limit('otp:m:' . $mobile, 6, 3600)) return [false, 'تعداد درخواست‌های این شماره زیاد است. یک ساعت دیگر تلاش کنید.', 0];
-    if (!rate_limit('otp:ip:' . client_ip(), 30, 3600)) return [false, 'تعداد درخواست‌ها از این شبکه زیاد است. کمی بعد تلاش کنید.', 0];
+    // Mobile carriers share one public IP between many users (CGNAT), so the per-IP cap is generous
+    if (!rate_limit('otp:ip:' . client_ip(), (int)setting('otp_ip_limit', 500), 3600)) return [false, 'تعداد درخواست‌ها از این شبکه زیاد است. کمی بعد تلاش کنید.', 0];
 
     $len = (int)setting('otp_length', 5);
     $code = (string)random_int((int)pow(10, $len - 1), (int)pow(10, $len) - 1);
@@ -70,6 +90,7 @@ function otp_send($mobile)
         [$mobile, otp_hash($mobile, $code), $t + 300, $t]
     );
     require_once APP . '/lib/sms.php';
+    db_close(); // don't hold one of the few DB connections while the SMS provider answers
     $ok = sms_send_otp($mobile, $code);
     if (!$ok) return [false, 'ارسال پیامک با خطا مواجه شد. لطفاً دوباره تلاش کنید.', 0];
     if (setting('sms_driver', 'log') === 'log') {
@@ -111,6 +132,7 @@ function current_admin()
 /** Roles: admin > operator > checkin */
 function require_admin($roles = ['admin'])
 {
+    start_session();
     $a = current_admin();
     if (!$a) {
         if (is_ajax()) json_out(['ok' => false, 'error' => 'ابتدا وارد پنل شوید.'], 401);

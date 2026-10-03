@@ -66,21 +66,48 @@
     document.getElementById('legend').innerHTML = h;
   }
 
-  var lastT = 0, firstPoll = true;
+  // ---- live availability ----
+  // Polls the static file the server rewrites on every change (cheap 304s); every
+  // ~60s, or if the file is missing, the PHP endpoint is asked instead.
+  var lastT = 0, firstPoll = true, polls = 0, skew = 0, data = null;
+
+  function serverNow() { return Date.now() / 1000 + skew; }
+
+  function apply() {
+    if (!data) return;
+    var now = serverNow(), st = {};
+    data.u.forEach(function (id) { st[id] = 'u'; });
+    data.h.forEach(function (x) { if (x[1] >= now && !mine[x[0]] && !st[x[0]]) st[x[0]] = 'h'; });
+    map.seats.forEach(function (s) { if (D.prices[s.cat] === undefined && !st[s.id]) st[s.id] = 'np'; });
+    var cb = map.opt.onLost;
+    if (firstPoll) map.opt.onLost = null; // silently drop restored seats that are gone
+    map.setState(st);
+    map.opt.onLost = cb;
+    firstPoll = false;
+  }
+
+  function fetchStatus(url, isApi) {
+    var x = new XMLHttpRequest();
+    x.open('GET', url);
+    if (!isApi) x.setRequestHeader('Cache-Control', 'no-cache');
+    x.onload = function () {
+      if (x.status !== 200 && x.status !== 304) { if (!isApi) fetchStatus(D.api, true); return; }
+      var date = Date.parse(x.getResponseHeader('Date') || '');
+      if (date) skew = date / 1000 - Date.now() / 1000;
+      try {
+        var r = JSON.parse(x.responseText);
+        if (r.t >= lastT) { lastT = r.t; data = r; }
+      } catch (e) { return; }
+      apply();
+    };
+    x.onerror = function () { if (!isApi) fetchStatus(D.api, true); };
+    x.send();
+  }
+
   function poll() {
-    getJSON(D.status + (D.status.indexOf('?') > -1 ? '&' : '?') + '_=' + Date.now(), function (r) {
-      if (r.t < lastT) return;
-      lastT = r.t;
-      var st = {};
-      r.u.forEach(function (id) { st[id] = 'u'; });
-      r.h.forEach(function (id) { if (!mine[id]) st[id] = 'h'; });
-      map.seats.forEach(function (s) { if (D.prices[s.cat] === undefined && !st[s.id]) st[s.id] = 'np'; });
-      var cb = map.opt.onLost;
-      if (firstPoll) map.opt.onLost = null; // silently drop restored seats that are gone
-      map.setState(st);
-      map.opt.onLost = cb;
-      firstPoll = false;
-    });
+    polls++;
+    if (polls % 12 === 0) fetchStatus(D.api + (D.api.indexOf('?') > -1 ? '&' : '?') + '_=' + Date.now(), true);
+    else fetchStatus(D.status, false);
   }
 
   loadLayout(D.layout, function (L) {
@@ -106,7 +133,8 @@
     pre.forEach(function (id) { map.select(id, true); });
     poll();
     update(map.selected());
-    setInterval(function () { if (!document.hidden) poll(); }, 8000);
+    setInterval(function () { if (!document.hidden) poll(); }, 5000);
+    setInterval(apply, 15000); // expire holds locally even when nothing changed
     document.addEventListener('visibilitychange', function () { if (!document.hidden) poll(); });
   });
 })();

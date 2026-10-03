@@ -24,6 +24,27 @@ require APP . '/lib/jdate.php';
 require APP . '/lib/auth.php';
 
 set_exception_handler(function ($e) {
+    if ($e instanceof DbBusyException) {
+        // Peak traffic: ask the browser to retry shortly instead of showing an error
+        log_error('BUSY ' . (isset($_SERVER['REQUEST_URI']) ? $_SERVER['REQUEST_URI'] : ''));
+        if (!headers_sent()) {
+            http_response_code(503);
+            header('Retry-After: 3');
+            header('Cache-Control: no-store');
+        }
+        if (is_ajax()) {
+            if (!headers_sent()) header('Content-Type: application/json; charset=utf-8');
+            echo json_encode(['ok' => false, 'busy' => true, 'error' => 'سرور در حال حاضر شلوغ است. چند ثانیه دیگر دوباره تلاش کنید.'], JSON_UNESCAPED_UNICODE);
+            return;
+        }
+        $isGet = !isset($_SERVER['REQUEST_METHOD']) || $_SERVER['REQUEST_METHOD'] === 'GET';
+        echo '<!doctype html><html lang="fa" dir="rtl"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
+            . ($isGet ? '<meta http-equiv="refresh" content="4">' : '')
+            . '<title>لطفاً چند لحظه صبر کنید</title><body style="font-family:Vazirmatn,tahoma;padding:60px 20px;text-align:center;background:#f6f7f9;color:#16181d">'
+            . '<h2>استقبال از همایش زیاد است!</h2><p>' . ($isGet ? 'صفحه تا چند ثانیه دیگر خودکار دوباره بارگذاری می‌شود…' : 'لطفاً چند ثانیه دیگر دوباره تلاش کنید. اطلاعات شما ثبت نشده است.') . '</p>'
+            . '<p><a href="javascript:location.reload()">تلاش مجدد</a></p></body></html>';
+        return;
+    }
     log_error((string)$e);
     if (!headers_sent()) {
         http_response_code(500);

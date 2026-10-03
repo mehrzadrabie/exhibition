@@ -25,6 +25,7 @@ function account_login_send()
 
 function account_verify_form()
 {
+    if (current_user()) redirect('/');
     if (empty($_SESSION['otp_mobile'])) redirect('/login');
     $mobile = $_SESSION['otp_mobile'];
     $row = db_row('SELECT sent_at FROM otp_codes WHERE mobile = ?', [$mobile]);
@@ -35,9 +36,11 @@ function account_verify_form()
 
 function account_verify_submit()
 {
+    // Double submit (auto-submit + tap on the button): the first request already logged in
+    if (current_user()) redirect('/');
     if (empty($_SESSION['otp_mobile'])) redirect('/login');
     $mobile = $_SESSION['otp_mobile'];
-    if (!rate_limit('otpv:ip:' . client_ip(), 40, 600)) {
+    if (!rate_limit('otpv:ip:' . client_ip(), 400, 600)) {
         flash('err', 'تعداد تلاش‌ها زیاد است. چند دقیقه دیگر تلاش کنید.');
         redirect('/login/verify');
     }
@@ -46,11 +49,7 @@ function account_verify_submit()
         flash('err', $msg);
         redirect('/login/verify');
     }
-    $user = db_row('SELECT * FROM users WHERE mobile = ?', [$mobile]);
-    if (!$user) {
-        $id = db_insert('users', ['mobile' => $mobile, 'created_at' => now()]);
-        $user = db_row('SELECT * FROM users WHERE id = ?', [$id]);
-    }
+    $user = user_find_or_create($mobile);
     if ($user['is_blocked']) {
         flash('err', 'حساب کاربری شما مسدود شده است.');
         redirect('/login');
@@ -63,7 +62,7 @@ function account_verify_submit()
         $_SESSION['after_login'] = $after;
         redirect('/profile');
     }
-    header('Location: ' . (strpos($after, '/') === 0 ? $after : url('/')));
+    header('Location: ' . safe_local_path($after));
     exit;
 }
 
@@ -106,8 +105,8 @@ function account_profile_save()
     $after = isset($_SESSION['after_login']) ? $_SESSION['after_login'] : null;
     unset($_SESSION['after_login']);
     flash('ok', 'مشخصات شما ذخیره شد.');
-    if ($after && strpos($after, '/') === 0) {
-        header('Location: ' . $after);
+    if ($after) {
+        header('Location: ' . safe_local_path($after));
         exit;
     }
     redirect('/my');

@@ -179,34 +179,71 @@ function hall_seed()
 
 /* ---------------------------------------------------------------- */
 
-/**
- * Current public seat states for a session, micro-cached.
- * @return string JSON {"t":ts,"u":[unavailable ids],"h":[held ids]}
+/*
+ * Seat availability is published as a static JSON file (assets/cache/seats-{id}.json)
+ * rewritten after every change. Browsers poll that file directly, so hundreds of
+ * people watching the seat map cost no PHP process and no DB connection (the web
+ * server answers "304 Not Modified" most of the time).
+ * Holds carry their expiry time and the browser expires them itself, so no cron is needed.
+ * Format: {"t": generated_at, "u": [sold/blocked ids], "h": [[held id, hold_until], ...]}
  */
-function session_status_json($sessionId)
+function session_status_build($sessionId)
 {
-    $key = 'seats:' . $sessionId;
-    $cached = kv_get($key);
-    if ($cached !== null) return $cached;
     $t = time();
     $u = [];
     $h = [];
     foreach (db_all('SELECT seat_id, status, hold_until FROM session_seats WHERE session_id = ? AND status > 0', [(int)$sessionId]) as $r) {
-        $st = (int)$r['status'];
-        if ($st === 1) {
-            if ((int)$r['hold_until'] >= $t) $h[] = (int)$r['seat_id'];
+        if ((int)$r['status'] === 1) {
+            if ((int)$r['hold_until'] >= $t) $h[] = [(int)$r['seat_id'], (int)$r['hold_until']];
         } else {
             $u[] = (int)$r['seat_id'];
         }
     }
-    $json = json_encode(['t' => $t, 'u' => $u, 'h' => $h]);
-    kv_set($key, $json, 4);
+    return json_encode(['t' => $t, 'u' => $u, 'h' => $h]);
+}
+
+function session_status_file($sessionId)
+{
+    return ROOT . '/assets/cache/seats-' . (int)$sessionId . '.json';
+}
+
+function session_status_public_url($sessionId)
+{
+    return base_path() . '/assets/cache/seats-' . (int)$sessionId . '.json';
+}
+
+/**
+ * Rebuild and publish the file. Serialised with a lock so a slower writer can never
+ * overwrite a newer snapshot with an older one.
+ */
+function session_status_publish($sessionId)
+{
+    $lock = @fopen(ROOT . '/storage/cache/seats-' . (int)$sessionId . '.lock', 'c');
+    if ($lock) flock($lock, LOCK_EX);
+    try {
+        $json = session_status_build($sessionId);
+        $file = session_status_file($sessionId);
+        $tmp = $file . '.' . getmypid() . '.tmp';
+        if (@file_put_contents($tmp, $json) !== false) @rename($tmp, $file);
+    } finally {
+        if ($lock) {
+            flock($lock, LOCK_UN);
+            fclose($lock);
+        }
+    }
     return $json;
 }
 
+/** Called after every seat change (name kept for the call sites). */
 function session_status_invalidate($sessionId)
 {
-    kv_del('seats:' . $sessionId);
+    session_status_publish($sessionId);
+}
+
+/** PHP fallback / periodic consistency check; also refreshes the static file. */
+function session_status_json($sessionId)
+{
+    return session_status_publish($sessionId);
 }
 
 function session_seats_init($sessionId)

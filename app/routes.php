@@ -97,8 +97,12 @@ foreach ($routes as $r) {
     if (!preg_match($r[1], $path, $m)) continue;
     array_shift($m);
     if (empty($r[4]) || $r[4] !== 'nosess') {
-        start_session();
+        // Anonymous GET visitors (campaign landing traffic) get no session file at all;
+        // forms that need a CSRF token start one lazily.
+        if ($method === 'POST' || strpos($path, '/admin') === 0) start_session();
+        else resume_session();
         if ($method === 'POST' && (empty($r[4]) || $r[4] !== 'nocsrf')) csrf_check();
+        maybe_maintenance();
         header('X-Frame-Options: SAMEORIGIN');
         header('Referrer-Policy: same-origin');
     }
@@ -108,5 +112,5 @@ foreach ($routes as $r) {
     exit;
 }
 
-start_session();
+resume_session();
 abort(404);

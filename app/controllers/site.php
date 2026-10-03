@@ -3,6 +3,11 @@ defined('ROOT') || exit;
 
 function site_home()
 {
+    // The landing page of a campaign gets the burst: serve its data from a 10s cache
+    $cached = kv_get('home:v1');
+    if ($cached !== null && ($d = @unserialize($cached)) !== false) {
+        view('site/home', $d);
+    }
     $sessions = db_all('SELECT * FROM sessions WHERE is_public = 1 ORDER BY sort, starts_at');
     $minPrice = [];
     $avail = [];
@@ -23,7 +28,9 @@ function site_home()
         }
     }
     $speakers = db_all('SELECT * FROM speakers WHERE is_active = 1 ORDER BY sort, id');
-    view('site/home', compact('sessions', 'minPrice', 'avail', 'speakers'));
+    $d = compact('sessions', 'minPrice', 'avail', 'speakers');
+    kv_set('home:v1', serialize($d), 10);
+    view('site/home', $d);
 }
 
 function site_rewrite_test()
@@ -38,5 +45,12 @@ function site_api_seats($id)
     require_once APP . '/lib/hall.php';
     header('Content-Type: application/json; charset=utf-8');
     header('Cache-Control: no-store');
+    // Serve the published file when it is fresh; rebuild at most every few seconds
+    $f = session_status_file((int)$id);
+    $m = @filemtime($f);
+    if ($m && time() - $m < 5) {
+        readfile($f);
+        return;
+    }
     echo session_status_json((int)$id);
 }

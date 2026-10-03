@@ -21,10 +21,12 @@ function booking_seat_page($id)
         if ($pending) $mine = array_map('intval', db_col('SELECT seat_id FROM order_items WHERE order_id = ?', [(int)$pending['id']]));
     }
     $prices = session_prices($session['id']);
+    if (!is_file(session_status_file($session['id']))) session_status_publish($session['id']);
     $data = [
         'sid' => (int)$session['id'],
         'layout' => layout_public_url(),
-        'status' => url('/api/seats/' . $session['id']),
+        'status' => session_status_public_url($session['id']),
+        'api' => url('/api/seats/' . $session['id']),
         'prices' => (object)$prices,
         'max' => (int)$session['max_per_order'],
         'mine' => $mine,
@@ -156,6 +158,7 @@ function booking_order_pay($id)
 
     require_once APP . '/lib/payment.php';
     require_once APP . '/lib/hall.php';
+    db_close(); // the bank API can take a few seconds; free the DB slot meanwhile
     $res = gateway_request($o, $u);
     if (!$res['ok']) {
         flash('err', $res['error'] . ' لطفاً دوباره تلاش کنید.');
@@ -247,6 +250,8 @@ function booking_payment_callback()
     // Make sure the seats are still ours BEFORE settling the payment.
     // If not, we do not verify; the gateway automatically refunds unverified payments.
     if (!booking_reclaim($o, 10 * 60)) {
+        // A parallel callback (double click / refresh) may have just completed the order
+        if (db_val('SELECT status FROM orders WHERE id = ?', [(int)$o['id']]) === 'paid') redirect('/order/' . $o['id']);
         db_update('orders', ['status' => 'failed', 'note' => 'seats lost before verify'], 'id = ? AND status <> ?', [(int)$o['id'], 'paid']);
         flash('err', 'متأسفانه صندلی‌های این سفارش در این فاصله به فروش رفتند. پرداخت شما تأیید نشد و مبلغ حداکثر ظرف ۷۲ ساعت توسط بانک به حساب شما بازمی‌گردد.');
         redirect('/order/' . $o['id']);
@@ -257,7 +262,10 @@ function booking_payment_callback()
         flash('err', $v['error'] . ' در صورت کسر وجه، مبلغ ظرف ۷۲ ساعت بازمی‌گردد.');
         redirect('/order/' . $o['id']);
     }
-    booking_finalize($o['id'], ['method' => $o['method'], 'ref_id' => $v['ref_id'], 'card' => $v['card']]);
+    if (!booking_finalize($o['id'], ['method' => $o['method'], 'ref_id' => $v['ref_id'], 'card' => $v['card']])) {
+        flash('err', 'پرداخت شما ثبت شد اما در تخصیص صندلی مشکلی پیش آمد. پشتیبانی با شما تماس می‌گیرد (کد پیگیری: ' . $v['ref_id'] . ').');
+        redirect('/order/' . $o['id']);
+    }
     flash('ok', 'پرداخت با موفقیت انجام شد و بلیط‌های شما صادر شد.');
     redirect('/order/' . $o['id']);
 }

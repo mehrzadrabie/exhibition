@@ -153,27 +153,37 @@ function start_session()
         'httponly' => true,
         'samesite' => 'Lax',
     ];
-    if (PHP_VERSION_ID >= 70300) {
-        session_set_cookie_params($params);
-    } else {
-        session_set_cookie_params(0, $params['path'] . '; samesite=Lax', '', $params['secure'], true);
-    }
+    session_set_cookie_params($params);
     session_name('CNFSID');
     ini_set('session.use_strict_mode', '1');
     ini_set('session.gc_maxlifetime', '86400');
     $dir = ROOT . '/storage/sessions';
-    if (is_dir($dir) && is_writable($dir)) session_save_path($dir);
+    if (is_dir($dir) && is_writable($dir)) {
+        session_save_path($dir);
+        // Many hosts disable PHP's own GC (expecting a cron job); with a private
+        // save path we must clean up ourselves.
+        ini_set('session.gc_probability', '1');
+        ini_set('session.gc_divisor', '500');
+    }
     session_start();
+}
+
+/** Start the session only when the browser already has one (anonymous visitors stay session-free). */
+function resume_session()
+{
+    if (session_status() !== PHP_SESSION_ACTIVE && !empty($_COOKIE['CNFSID'])) start_session();
 }
 
 function flash($type, $msg)
 {
+    start_session();
     $_SESSION['_flash'][] = [$type, $msg];
 }
 
 function flashes()
 {
-    $f = isset($_SESSION['_flash']) ? $_SESSION['_flash'] : [];
+    if (session_status() !== PHP_SESSION_ACTIVE || empty($_SESSION['_flash'])) return [];
+    $f = $_SESSION['_flash'];
     unset($_SESSION['_flash']);
     return $f;
 }
@@ -185,6 +195,7 @@ function old($key, $default = '')
 
 function csrf_token()
 {
+    start_session();
     if (empty($_SESSION['_csrf'])) $_SESSION['_csrf'] = bin2hex(random_bytes(16));
     return $_SESSION['_csrf'];
 }
@@ -361,9 +372,22 @@ function rate_limit($key, $max, $window)
     return $hits <= $max;
 }
 
+/**
+ * Visitor IP. Behind a CDN (ArvanCloud, Cloudflare, ...) REMOTE_ADDR is the CDN's
+ * address, so set config 'ip_header' (e.g. HTTP_AR_REAL_IP, HTTP_CF_CONNECTING_IP,
+ * HTTP_X_FORWARDED_FOR) – only when the site is really behind that proxy.
+ */
 function client_ip()
 {
-    return isset($_SERVER['REMOTE_ADDR']) ? $_SERVER['REMOTE_ADDR'] : '0.0.0.0';
+    static $ip = null;
+    if ($ip !== null) return $ip;
+    $ip = isset($_SERVER['REMOTE_ADDR']) ? $_SERVER['REMOTE_ADDR'] : '0.0.0.0';
+    $h = config('ip_header') ?: (function_exists('setting') ? setting('ip_header') : '');
+    if ($h && in_array($h, ['HTTP_AR_REAL_IP', 'HTTP_CF_CONNECTING_IP', 'HTTP_X_FORWARDED_FOR', 'HTTP_X_REAL_IP'], true) && !empty($_SERVER[$h])) {
+        $cand = trim(explode(',', $_SERVER[$h])[0]);
+        if (filter_var($cand, FILTER_VALIDATE_IP)) $ip = $cand;
+    }
+    return $ip;
 }
 
 /* ---------------- After-response tasks ---------------- */
@@ -375,14 +399,25 @@ function defer(callable $fn)
     if (!$registered) {
         $registered = true;
         register_shutdown_function(function () {
+            if (session_status() === PHP_SESSION_ACTIVE) session_write_close();
             if (function_exists('fastcgi_finish_request')) {
-                @session_write_close();
                 fastcgi_finish_request();
             } elseif (function_exists('litespeed_finish_request')) {
-                @session_write_close();
                 litespeed_finish_request();
+            } elseif (!headers_sent()) {
+                // Apache mod_php: collect the buffered output, announce its exact length
+                // and close the connection so the browser doesn't wait for the work below
+                $out = '';
+                while (ob_get_level() > 0) $out = ob_get_clean() . $out;
+                if (function_exists('apache_setenv')) @apache_setenv('no-gzip', '1');
+                header('Content-Encoding: none');
+                header('Content-Length: ' . strlen($out));
+                header('Connection: close');
+                echo $out;
+                flush();
             }
             ignore_user_abort(true);
+            @set_time_limit(60);
             foreach ($GLOBALS['_deferred'] as $f) {
                 try {
                     $f();
@@ -392,6 +427,28 @@ function defer(callable $fn)
             }
         });
     }
+}
+
+/**
+ * Housekeeping without cron: runs on ~1 of 300 requests after the response.
+ * Expired rate-limit rows / OTPs, and holds abandoned for 30+ minutes.
+ */
+function maybe_maintenance()
+{
+    if (random_int(1, 300) !== 1) return;
+    defer(function () {
+        $t = time();
+        db_exec('DELETE FROM rate_limits WHERE reset_at < ? LIMIT 2000', [$t - 60]);
+        db_exec('DELETE FROM otp_codes WHERE expires_at < ? LIMIT 2000', [$t - 3600]);
+        $stale = $t - 1800;
+        $sids = db_col('SELECT DISTINCT session_id FROM session_seats WHERE status = 1 AND hold_until < ?', [$stale]);
+        if ($sids) {
+            db_exec('UPDATE session_seats SET status = 0, order_id = NULL, hold_until = NULL WHERE status = 1 AND hold_until < ?', [$stale]);
+            require_once APP . '/lib/hall.php';
+            foreach ($sids as $sid) session_status_invalidate($sid);
+        }
+        db_exec("UPDATE orders SET status = 'expired' WHERE status = 'pending' AND hold_until < ? LIMIT 2000", [$stale]);
+    });
 }
 
 /* ---------------- HTTP client ---------------- */
