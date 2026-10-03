@@ -4,6 +4,7 @@ $p = route_path();
 $nav = [
     ['/admin', 'داشبورد', ['admin', 'operator']],
     ['/admin/checkin', 'اسکن ورود (QR)', ['admin', 'operator', 'checkin']],
+    ['/admin/display', 'نمایشگر خوش‌آمد', ['admin']],
     ['/admin/orders', 'سفارش‌ها', ['admin', 'operator']],
     ['/admin/tickets', 'بلیط‌ها و حضور', ['admin', 'operator']],
     ['/admin/issue', 'صدور بلیط دستی / VIP', ['admin', 'operator']],
